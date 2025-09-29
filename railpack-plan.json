@@ -1,0 +1,7 @@
+{
+  "build": {
+    "packages": {
+      "python": "3.11.9"
+    }
+  }
+}
