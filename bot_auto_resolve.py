@@ -1,6 +1,7 @@
 # bot_auto_resolve.py
 import os
 import time
+import asyncio
 import logging
 from datetime import datetime
 from dotenv import load_dotenv
@@ -9,33 +10,31 @@ from dotenv import load_dotenv
 try:
     from dhanhq import marketfeed
 except Exception as e:
-    logging.exception("dhanhq import error (install dhanhq>=1.x/2.x): %s", e)
+    logging.exception("dhanhq import error: %s", e)
     raise
 
-# telegram import
 try:
     from telegram import Bot
 except Exception as e:
     logging.exception("python-telegram-bot import error: %s", e)
     raise
 
-# local security id map (ensure this file exists)
+# optional local mapping file
 try:
     from dhanhq_security_ids import INDICES_NSE, INDICES_BSE, NIFTY50_STOCKS
 except Exception:
-    # fallback minimal map if file missing
     INDICES_NSE = {"NIFTY 50": "13", "NIFTY BANK": "25"}
     INDICES_BSE = {"SENSEX": "51"}
     NIFTY50_STOCKS = {"TATAMOTORS": "3456", "RELIANCE": "2885", "TCS": "11536"}
 
 load_dotenv()
 
-# ---------- config ----------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 logging.basicConfig(level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
                     format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("dhan-bot")
+log = logging.getLogger("dhan-bot-async")
 
+# env names: accept DHAN_ACCESS_TOKEN or DHAN_TOKEN
 DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID")
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN") or os.getenv("DHAN_TOKEN")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -43,12 +42,11 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
 
 if not (DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN):
-    log.error("Missing DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN in environment.")
-    # do not exit here to allow dev to import module for inspection
+    log.warning("DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN not set. Feed will likely fail until set in .env")
 
 tg_bot = Bot(token=TELEGRAM_TOKEN) if TELEGRAM_TOKEN else None
 
-# ---------- symbols (edit as needed) ----------
+# symbols to track
 SYMBOLS = [
     ("NIFTY 50", "indices_nse"),
     ("NIFTY BANK", "indices_nse"),
@@ -58,13 +56,8 @@ SYMBOLS = [
     ("TCS", "nifty50"),
 ]
 
-# ---------- resolve helpers ----------
+# ---------- resolver ----------
 def resolve_symbols_list():
-    """
-    Returns:
-      instruments_raw: list of (seg, sid) strings as returned by scrip
-      resolved_map: mapping display_name -> sid
-    """
     instruments = []
     resolved_map = {}
     for name, kind in SYMBOLS:
@@ -79,237 +72,222 @@ def resolve_symbols_list():
         else:
             sid = NIFTY50_STOCKS.get(name)
             seg = "NSE_EQ"
+        resolved_map[name] = {"seg": seg, "sid": str(sid) if sid else None}
         if sid:
             instruments.append((seg, str(sid)))
-            resolved_map[name] = {"seg": seg, "sid": str(sid)}
             log.info("Resolved %s -> %s:%s", name, seg, sid)
         else:
-            resolved_map[name] = {"seg": None, "sid": None}
             log.warning("Could not resolve %s", name)
+    log.info("Final instruments: %s", instruments)
     return instruments, resolved_map
 
-# ---------- LTP storage ----------
-latest = {}  # display_name -> (ltp, change, pct, seg)
+# ---------- LTP storage and helpers ----------
+latest = {}  # name -> {"ltp": value, "raw": tick}
 _last_sent = 0.0
 
-# ---------- utility to extract LTP from tick with many possible keys ----------
 def extract_ltp_from_tick(tick):
-    # support many key names that different SDKs might use
-    candidates = [
-        "LTP", "ltp", "last_price", "lastPrice", "lastPriceTicks", "last"
-    ]
+    if not isinstance(tick, dict):
+        return None
+    candidates = ["LTP", "ltp", "last_price", "lastPrice", "lastPriceTicks", "last", "lastTradedPrice"]
     for k in candidates:
         if k in tick and tick[k] is not None:
             return tick[k]
-    # sometimes data nested
-    if "data" in tick and isinstance(tick["data"], dict):
-        for k in candidates:
-            if k in tick["data"] and tick["data"][k] is not None:
-                return tick["data"][k]
-    # fallback None
+    # nested checks
+    for parent in ("data", "instrument", "payload"):
+        if parent in tick and isinstance(tick[parent], dict):
+            for k in candidates:
+                if k in tick[parent] and tick[parent][k] is not None:
+                    return tick[parent][k]
     return None
 
-# ---------- robust feed creator (tries multiple SDK signatures) ----------
+# ---------- robust create_feed (tries multiple SDK signatures) ----------
 def create_feed(instruments):
     """
-    Tries different constructor signatures and constants for dhanhq.marketfeed.DhanFeed.
-    Returns constructed feed object or raises exception.
+    Try several constructor argument patterns for marketfeed.DhanFeed.
+    Returns feed object. May be sync or async API.
     """
-    log.info("Creating DhanFeed for instruments: %s", instruments)
-
-    # Try several instrument formats:
-    # A) list of tuples like ("NSE_EQ", "1333")
-    # B) list of dicts like {"ExchangeSegment": "NSE_EQ", "SecurityId": "1333"}
+    attempts = []
     inst_tuples = list(instruments)
     inst_dicts = [{"ExchangeSegment": seg, "SecurityId": sid} for seg, sid in instruments]
 
-    # candidate kwargs patterns to try
-    attempts = []
-
-    # 1) older style: subscription_code
-    attempts.append({"kwargs": {"client_id": DHAN_CLIENT_ID, "access_token": DHAN_ACCESS_TOKEN,
-                                "instruments": inst_tuples, "subscription_code": getattr(marketfeed, "Ticker", None)}})
-
-    # 2) newer style: feed_type = marketfeed.FeedType.TICKER
+    # attempt patterns
+    attempts.append({"args": (), "kwargs": {"client_id": DHAN_CLIENT_ID, "access_token": DHAN_ACCESS_TOKEN, "instruments": inst_tuples, "subscription_code": getattr(marketfeed, "Ticker", None)}})
     if hasattr(marketfeed, "FeedType"):
-        ft = getattr(marketfeed, "FeedType")
-        # try FeedType enum attribute names
-        chosen = None
-        for name in ("TICKER", "Ticker", "TickerFeed"):
-            if hasattr(ft, name):
-                chosen = getattr(ft, name)
-                break
-        if chosen is None:
-            # maybe FeedType has .TICKER attribute directly
-            chosen = getattr(ft, "TICKER", None)
-        attempts.append({"kwargs": {"client_id": DHAN_CLIENT_ID, "access_token": DHAN_ACCESS_TOKEN,
-                                    "instruments": inst_tuples, "feed_type": chosen}})
-
-    # 3) older style feed_type with string value
-    attempts.append({"kwargs": {"client_id": DHAN_CLIENT_ID, "access_token": DHAN_ACCESS_TOKEN,
-                                "instruments": inst_tuples, "feed_type": "TICKER"}})
-
-    # 4) try using inst_dicts and feed_type if SDK expects dict instruments
-    attempts.append({"kwargs": {"client_id": DHAN_CLIENT_ID, "access_token": DHAN_ACCESS_TOKEN,
-                                "instruments": inst_dicts, "feed_type": "TICKER"}})
-
-    # 5) last resort: positional args (client_id, access_token, instruments)
+        try:
+            ft = marketfeed.FeedType
+            candidate = getattr(ft, "TICKER", getattr(ft, "Ticker", None))
+            attempts.append({"args": (), "kwargs": {"client_id": DHAN_CLIENT_ID, "access_token": DHAN_ACCESS_TOKEN, "instruments": inst_tuples, "feed_type": candidate}})
+        except Exception:
+            pass
+    attempts.append({"args": (), "kwargs": {"client_id": DHAN_CLIENT_ID, "access_token": DHAN_ACCESS_TOKEN, "instruments": inst_dicts, "feed_type": "TICKER"}})
+    # positional fallback
     attempts.append({"args": (DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, inst_tuples), "kwargs": {}})
 
     last_exc = None
-    for idx, a in enumerate(attempts):
+    for idx, a in enumerate(attempts, start=1):
         try:
             args = a.get("args", ())
             kwargs = a.get("kwargs", {})
-            log.debug("Trying DhanFeed constructor attempt #%d: args=%s kwargs=%s", idx+1, args, {k: type(v).__name__ for k,v in kwargs.items()})
+            log.debug("Trying DhanFeed ctor attempt #%d args=%s kwargs=%s", idx, args, {k: type(v).__name__ for k,v in kwargs.items()})
             feed = marketfeed.DhanFeed(*args, **kwargs)
-            log.info("DhanFeed created with attempt #%d", idx+1)
+            log.info("DhanFeed created with attempt #%d", idx)
             return feed
         except Exception as e:
-            log.debug("Attempt #%d failed: %s", idx+1, e)
+            log.debug("Attempt #%d failed: %s", idx, e)
             last_exc = e
             continue
-    # if all attempts failed raise last exception
-    log.error("All DhanFeed constructor attempts failed. Last error: %s", last_exc)
     raise last_exc or RuntimeError("Unable to construct DhanFeed")
 
-# ---------- on_tick conversion (wraps feed callback) ----------
-def make_on_tick_callback(resolved_map):
-    def _on_tick(tick):
+# ---------- attach callback robustly ----------
+def attach_callback(feed, callback):
+    if hasattr(feed, "on_tick"):
         try:
-            # Support various tick shapes: dict keys and nested
-            # Find security id from tick
+            feed.on_tick = callback
+            return True
+        except Exception:
+            pass
+    # other possible attach methods:
+    for name in ("register", "subscribe", "add_listener", "set_callback"):
+        if hasattr(feed, name):
+            try:
+                getattr(feed, name)(callback)
+                return True
+            except Exception:
+                pass
+    # last resort: set attribute
+    try:
+        setattr(feed, "on_tick", callback)
+        return True
+    except Exception:
+        return False
+
+# ---------- callback factory ----------
+def make_callback(resolved_map):
+    def _cb(tick):
+        try:
+            # discover security id
             sid = None
-            for k in ("SecurityId", "securityId", "SecurityID", "securityID", "security_id", "sid"):
-                if k in tick and tick[k] is not None:
-                    sid = str(tick[k])
-                    break
-            # sometimes nested under "instrument" or "data"
+            for k in ("SecurityId", "securityId", "sid", "security_id"):
+                if isinstance(tick, dict) and k in tick and tick[k] is not None:
+                    sid = str(tick[k]); break
             if sid is None:
-                if "instrument" in tick and isinstance(tick["instrument"], dict):
-                    for k in ("securityId", "SecurityId", "sid"):
-                        if k in tick["instrument"]:
-                            sid = str(tick["instrument"][k])
-                            break
-            if sid is None and "data" in tick and isinstance(tick["data"], dict):
-                for k in ("securityId", "SecurityId", "sid"):
-                    if k in tick["data"]:
-                        sid = str(tick["data"][k])
-                        break
-
+                for parent in ("data", "instrument", "payload"):
+                    if parent in tick and isinstance(tick[parent], dict):
+                        for k in ("SecurityId", "securityId", "sid"):
+                            if k in tick[parent]:
+                                sid = str(tick[parent][k]); break
+                        if sid: break
             if sid is None:
-                # cannot identify security id
                 return
-
-            # find display name by sid
-            disp = None
+            # find display name
+            disp_name = None
             for name, info in resolved_map.items():
                 if info.get("sid") == sid:
-                    disp = name
-                    break
-
-            if not disp:
-                # maybe resolved_map stores names differently - try partial match
+                    disp_name = name; break
+            if not disp_name:
+                # maybe resolved_map keys are like "NIFTY 50 (NSE_INDEX)": try prefix match
                 for name, info in resolved_map.items():
                     if info.get("sid") == sid:
-                        disp = name
-                        break
-
+                        disp_name = name; break
             ltp = extract_ltp_from_tick(tick)
+            latest[disp_name or sid] = {"ltp": ltp, "raw": tick}
+            # throttle send below via periodic task; but allow immediate try
+            return
+        except Exception:
+            log.exception("Error processing tick")
+    return _cb
 
-            if disp:
-                if ltp is not None:
-                    latest[disp] = {"ltp": ltp, "raw": tick}
-                else:
-                    latest[disp] = {"ltp": None, "raw": tick}
-                # send throttled update
-                _maybe_send_telegram_update()
-        except Exception as e:
-            log.exception("Error in tick callback: %s", e)
-    return _on_tick
-
-# ---------- telegram send (throttled) ----------
-def _maybe_send_telegram_update():
+# ---------- periodic telegram sender (async) ----------
+async def periodic_sender(resolved_map):
     global _last_sent
-    now = time.time()
-    if now - _last_sent < max(10, POLL_INTERVAL):  # ensure at least POLL_INTERVAL between sends (POLL_INTERVAL default 60)
-        return
-    _last_sent = now
-
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S IST")
-    lines = [f"LTP Update • {ts}"]
-    for name, info in resolved_map.items():
-        # resolved_map keys are display names we used originally (like "NIFTY 50")
-        sid = info.get("sid")
-        seg = info.get("seg") or ""
-        # find latest by display name (we stored by original name)
-        val = latest.get(name)
-        if val and val.get("ltp") is not None:
-            try:
-                ltp_f = float(val["ltp"])
-                lines.append(f"{name} ({seg}): {ltp_f:.2f}")
-            except Exception:
-                lines.append(f"{name} ({seg}): {val['ltp']}")
-        else:
-            lines.append(f"{name} ({seg}): (No Data)")
-    text = "\n".join(lines)
-    if tg_bot:
+    while True:
         try:
-            tg_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
-            log.info("Telegram update sent (%d lines).", len(lines))
-        except Exception as e:
-            log.exception("Failed to send Telegram message: %s", e)
-    else:
-        log.info("Telegram token not configured; skipping send. Message would be:\n%s", text)
+            now = time.time()
+            if now - _last_sent >= POLL_INTERVAL:
+                _last_sent = now
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S IST")
+                lines = [f"LTP Update • {ts}"]
+                for name, info in resolved_map.items():
+                    seg = info.get("seg") or ""
+                    val = latest.get(name)
+                    if val and val.get("ltp") is not None:
+                        try:
+                            ltp_f = float(val["ltp"])
+                            lines.append(f"{name} ({seg}): {ltp_f:.2f}")
+                        except Exception:
+                            lines.append(f"{name} ({seg}): {val['ltp']}")
+                    else:
+                        lines.append(f"{name} ({seg}): (No Data)")
+                text = "\n".join(lines)
+                if tg_bot:
+                    try:
+                        tg_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+                        log.info("Sent Telegram update (%d lines)", len(lines))
+                    except Exception:
+                        log.exception("Telegram send failed")
+                else:
+                    log.info("No Telegram token configured — update:\n%s", text)
+        except Exception:
+            log.exception("Error in periodic sender")
+        await asyncio.sleep(1)
 
-# ---------- main runner ----------
-def main():
-    global resolved_map
+# ---------- main async runner ----------
+async def main_async():
     instruments, resolved_map = resolve_symbols_list()
-    # build instruments list in a format to pass to SDK (we'll try multiple patterns in create_feed)
-    try:
-        feed = create_feed(instruments)
-    except Exception as e:
-        log.exception("Could not create feed: %s", e)
-        raise
+    # create feed (may be sync or async construct; create_feed may raise)
+    feed = create_feed(instruments)
 
-    # attach callback using robust wrapper
-    callback = make_on_tick_callback(resolved_map)
+    # attach callback
+    cb = make_callback(resolved_map)
+    ok = attach_callback(feed, cb)
+    if not ok:
+        log.warning("Could not attach callback to feed; proceeding but ticks may not be processed.")
+
+    # If feed.connect is coroutine, await it and leave running;
+    # otherwise if it is sync method returning None, run it in thread executor.
+    connect_callable = getattr(feed, "connect", None)
+    disconnect_callable = getattr(feed, "disconnect", None)
+
+    # start periodic sender task
+    sender_task = asyncio.create_task(periodic_sender(resolved_map))
+
     try:
-        # many SDKs use feed.on_tick or feed.register or feed.set_on_tick
-        if hasattr(feed, "on_tick"):
-            feed.on_tick = callback
-        elif hasattr(feed, "register"):
-            feed.register("tick", callback)
-        elif hasattr(feed, "subscribe"):
-            feed.subscribe(callback)
+        if asyncio.iscoroutinefunction(connect_callable):
+            log.info("Using async feed.connect()")
+            await connect_callable()
         else:
-            log.warning("Feed object has no known attach method; attempting attribute assignment 'on_tick'")
-            try:
-                setattr(feed, "on_tick", callback)
-            except Exception:
-                log.error("Couldn't attach callback to feed.")
-                raise
-
-        log.info("Connecting feed...")
-        feed.connect()
-        # block forever; feed will call our callback
+            # calling possibly synchronous connect function in thread
+            log.info("Calling synchronous feed.connect() in executor")
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, connect_callable)
+        # at this point feed.connect likely blocks (keeps running). if it returns, continue loop.
+        # keep the event loop alive until cancelled
         while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        log.info("Interrupted, disconnecting feed...")
+            await asyncio.sleep(1)
+    finally:
+        log.info("Shutting down feed and sender")
         try:
-            feed.disconnect()
+            if disconnect_callable:
+                if asyncio.iscoroutinefunction(disconnect_callable):
+                    await disconnect_callable()
+                else:
+                    await asyncio.get_running_loop().run_in_executor(None, disconnect_callable)
+        except Exception:
+            log.exception("Error during disconnect")
+        try:
+            sender_task.cancel()
+            await sender_task
         except Exception:
             pass
-    except Exception as e:
-        log.exception("Feed runtime error: %s", e)
-        try:
-            feed.disconnect()
-        except Exception:
-            pass
-        raise
 
-# allow importing module without running
+# ---------- sync main wrapper ----------
+def main():
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        log.info("Keyboard interrupt — exiting")
+    except Exception:
+        log.exception("Unhandled exception in main()")
+
 if __name__ == "__main__":
     main()
