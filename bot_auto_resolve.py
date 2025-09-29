@@ -1,30 +1,54 @@
+# bot_auto_resolve.py
 import os
-import logging
 import time
+import logging
 from datetime import datetime
-from dhanhq import marketfeed
-from telegram import Bot
-from dhanhq_security_ids import INDICES_NSE, INDICES_BSE, NIFTY50_STOCKS
+from dotenv import load_dotenv
 
-# --------------------------------
-# Logging Setup
-# --------------------------------
-logging.basicConfig(level=logging.INFO,
+# try imports
+try:
+    from dhanhq import marketfeed
+except Exception as e:
+    logging.exception("dhanhq import error (install dhanhq>=1.x/2.x): %s", e)
+    raise
+
+# telegram import
+try:
+    from telegram import Bot
+except Exception as e:
+    logging.exception("python-telegram-bot import error: %s", e)
+    raise
+
+# local security id map (ensure this file exists)
+try:
+    from dhanhq_security_ids import INDICES_NSE, INDICES_BSE, NIFTY50_STOCKS
+except Exception:
+    # fallback minimal map if file missing
+    INDICES_NSE = {"NIFTY 50": "13", "NIFTY BANK": "25"}
+    INDICES_BSE = {"SENSEX": "51"}
+    NIFTY50_STOCKS = {"TATAMOTORS": "3456", "RELIANCE": "2885", "TCS": "11536"}
+
+load_dotenv()
+
+# ---------- config ----------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+logging.basicConfig(level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
                     format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("dhan-bot")
 
-# --------------------------------
-# Env Vars
-# --------------------------------
-client_id = os.getenv("DHAN_CLIENT_ID")
-access_token = os.getenv("DHAN_ACCESS_TOKEN")
-telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
-telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
+DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID")
+DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN") or os.getenv("DHAN_TOKEN")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
 
-bot = Bot(token=telegram_token)
+if not (DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN):
+    log.error("Missing DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN in environment.")
+    # do not exit here to allow dev to import module for inspection
 
-# --------------------------------
-# Symbols to track (user-defined)
-# --------------------------------
+tg_bot = Bot(token=TELEGRAM_TOKEN) if TELEGRAM_TOKEN else None
+
+# ---------- symbols (edit as needed) ----------
 SYMBOLS = [
     ("NIFTY 50", "indices_nse"),
     ("NIFTY BANK", "indices_nse"),
@@ -34,126 +58,258 @@ SYMBOLS = [
     ("TCS", "nifty50"),
 ]
 
-# --------------------------------
-# Helper - Resolve Security IDs
-# --------------------------------
-def resolve_symbols():
-    payload = []
+# ---------- resolve helpers ----------
+def resolve_symbols_list():
+    """
+    Returns:
+      instruments_raw: list of (seg, sid) strings as returned by scrip
+      resolved_map: mapping display_name -> sid
+    """
+    instruments = []
     resolved_map = {}
+    for name, kind in SYMBOLS:
+        sid = None
+        seg = None
+        if kind == "indices_nse":
+            sid = INDICES_NSE.get(name)
+            seg = "NSE_INDEX"
+        elif kind == "indices_bse":
+            sid = INDICES_BSE.get(name)
+            seg = "BSE_INDEX"
+        else:
+            sid = NIFTY50_STOCKS.get(name)
+            seg = "NSE_EQ"
+        if sid:
+            instruments.append((seg, str(sid)))
+            resolved_map[name] = {"seg": seg, "sid": str(sid)}
+            log.info("Resolved %s -> %s:%s", name, seg, sid)
+        else:
+            resolved_map[name] = {"seg": None, "sid": None}
+            log.warning("Could not resolve %s", name)
+    return instruments, resolved_map
 
-    for symbol, stype in SYMBOLS:
-        try:
-            if stype == "indices_nse":
-                sid = INDICES_NSE.get(symbol)
-                seg = "NSE_INDEX"
-            elif stype == "indices_bse":
-                sid = INDICES_BSE.get(symbol)
-                seg = "BSE_INDEX"
-            else:  # default nifty50
-                sid = NIFTY50_STOCKS.get(symbol)
-                seg = "NSE_EQ"
+# ---------- LTP storage ----------
+latest = {}  # display_name -> (ltp, change, pct, seg)
+_last_sent = 0.0
 
-            if sid:
-                payload.append((seg, sid))
-                resolved_map[f"{symbol} ({seg})"] = sid
-                logging.info(f"Resolved {symbol} -> {seg}:{sid}")
-            else:
-                resolved_map[f"{symbol}"] = None
-                logging.warning(f"{symbol} not found in dict")
-        except Exception as e:
-            logging.error(f"Error resolving {symbol}: {e}")
-            resolved_map[f"{symbol}"] = None
+# ---------- utility to extract LTP from tick with many possible keys ----------
+def extract_ltp_from_tick(tick):
+    # support many key names that different SDKs might use
+    candidates = [
+        "LTP", "ltp", "last_price", "lastPrice", "lastPriceTicks", "last"
+    ]
+    for k in candidates:
+        if k in tick and tick[k] is not None:
+            return tick[k]
+    # sometimes data nested
+    if "data" in tick and isinstance(tick["data"], dict):
+        for k in candidates:
+            if k in tick["data"] and tick["data"][k] is not None:
+                return tick["data"][k]
+    # fallback None
+    return None
 
-    logging.info(f"Final Instruments: {payload}")
-    return payload, resolved_map
+# ---------- robust feed creator (tries multiple SDK signatures) ----------
+def create_feed(instruments):
+    """
+    Tries different constructor signatures and constants for dhanhq.marketfeed.DhanFeed.
+    Returns constructed feed object or raises exception.
+    """
+    log.info("Creating DhanFeed for instruments: %s", instruments)
 
-# --------------------------------
-# WebSocket Callback
-# --------------------------------
-ltp_data = {}
-resolved_payload, resolved_map = resolve_symbols()
+    # Try several instrument formats:
+    # A) list of tuples like ("NSE_EQ", "1333")
+    # B) list of dicts like {"ExchangeSegment": "NSE_EQ", "SecurityId": "1333"}
+    inst_tuples = list(instruments)
+    inst_dicts = [{"ExchangeSegment": seg, "SecurityId": sid} for seg, sid in instruments]
 
-def on_tick(tick):
-    try:
-        sid = str(tick.get("securityId"))
-        ltp = tick.get("lastPrice")
+    # candidate kwargs patterns to try
+    attempts = []
 
-        # Find symbol name
-        symbol_name = None
-        for k, v in resolved_map.items():
-            if v == sid:
-                symbol_name = k
+    # 1) older style: subscription_code
+    attempts.append({"kwargs": {"client_id": DHAN_CLIENT_ID, "access_token": DHAN_ACCESS_TOKEN,
+                                "instruments": inst_tuples, "subscription_code": getattr(marketfeed, "Ticker", None)}})
+
+    # 2) newer style: feed_type = marketfeed.FeedType.TICKER
+    if hasattr(marketfeed, "FeedType"):
+        ft = getattr(marketfeed, "FeedType")
+        # try FeedType enum attribute names
+        chosen = None
+        for name in ("TICKER", "Ticker", "TickerFeed"):
+            if hasattr(ft, name):
+                chosen = getattr(ft, name)
                 break
+        if chosen is None:
+            # maybe FeedType has .TICKER attribute directly
+            chosen = getattr(ft, "TICKER", None)
+        attempts.append({"kwargs": {"client_id": DHAN_CLIENT_ID, "access_token": DHAN_ACCESS_TOKEN,
+                                    "instruments": inst_tuples, "feed_type": chosen}})
 
-        if not symbol_name:
-            return
+    # 3) older style feed_type with string value
+    attempts.append({"kwargs": {"client_id": DHAN_CLIENT_ID, "access_token": DHAN_ACCESS_TOKEN,
+                                "instruments": inst_tuples, "feed_type": "TICKER"}})
 
-        if ltp is not None:
-            ltp_data[symbol_name] = f"{ltp}"
-        else:
-            ltp_data[symbol_name] = "(No Data)"
+    # 4) try using inst_dicts and feed_type if SDK expects dict instruments
+    attempts.append({"kwargs": {"client_id": DHAN_CLIENT_ID, "access_token": DHAN_ACCESS_TOKEN,
+                                "instruments": inst_dicts, "feed_type": "TICKER"}})
 
-        # Format & Send update every tick
-        send_update()
-    except Exception as e:
-        logging.error(f"Tick error: {e}")
+    # 5) last resort: positional args (client_id, access_token, instruments)
+    attempts.append({"args": (DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, inst_tuples), "kwargs": {}})
 
-# --------------------------------
-# Telegram Send
-# --------------------------------
-last_sent = 0
-def send_update():
-    global last_sent
-    now = time.time()
-
-    # Limit updates: send every ~60s
-    if now - last_sent < 60:
-        return
-    last_sent = now
-
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    msg_lines = [f"LTP Update • {ts}"]
-
-    for symbol, _ in SYMBOLS:
-        match = [k for k in ltp_data.keys() if k.startswith(symbol)]
-        if match:
-            msg_lines.append(f"{match[0]}: {ltp_data.get(match[0], '(No Data)')}")
-        else:
-            msg_lines.append(f"{symbol}: (No Data)")
-
-    msg = "\n".join(msg_lines)
-    logging.info(f"Telegram Msg:\n{msg}")
-
-    try:
-        bot.send_message(chat_id=telegram_chat_id, text=msg)
-    except Exception as e:
-        logging.error(f"Telegram send failed: {e}")
-
-# --------------------------------
-# WebSocket Runner
-# --------------------------------
-def run_feed():
-    instruments = [(1, sid) for seg, sid in resolved_payload]  # all seg → NSE_EQ = 1 fallback
-    feed = marketfeed.DhanFeed(
-        client_id=client_id,
-        access_token=access_token,
-        instruments=instruments,
-        feed_type=marketfeed.FeedType.TICKER
-    )
-    feed.on_tick = on_tick
-    logging.info("Starting DhanHQ LTP Bot...")
-    feed.connect()
-
-# --------------------------------
-# Main
-# --------------------------------
-def main():
-    while True:
+    last_exc = None
+    for idx, a in enumerate(attempts):
         try:
-            run_feed()
+            args = a.get("args", ())
+            kwargs = a.get("kwargs", {})
+            log.debug("Trying DhanFeed constructor attempt #%d: args=%s kwargs=%s", idx+1, args, {k: type(v).__name__ for k,v in kwargs.items()})
+            feed = marketfeed.DhanFeed(*args, **kwargs)
+            log.info("DhanFeed created with attempt #%d", idx+1)
+            return feed
         except Exception as e:
-            logging.error(f"WebSocket crashed: {e}, retrying in 5s...")
-            time.sleep(5)
+            log.debug("Attempt #%d failed: %s", idx+1, e)
+            last_exc = e
+            continue
+    # if all attempts failed raise last exception
+    log.error("All DhanFeed constructor attempts failed. Last error: %s", last_exc)
+    raise last_exc or RuntimeError("Unable to construct DhanFeed")
 
+# ---------- on_tick conversion (wraps feed callback) ----------
+def make_on_tick_callback(resolved_map):
+    def _on_tick(tick):
+        try:
+            # Support various tick shapes: dict keys and nested
+            # Find security id from tick
+            sid = None
+            for k in ("SecurityId", "securityId", "SecurityID", "securityID", "security_id", "sid"):
+                if k in tick and tick[k] is not None:
+                    sid = str(tick[k])
+                    break
+            # sometimes nested under "instrument" or "data"
+            if sid is None:
+                if "instrument" in tick and isinstance(tick["instrument"], dict):
+                    for k in ("securityId", "SecurityId", "sid"):
+                        if k in tick["instrument"]:
+                            sid = str(tick["instrument"][k])
+                            break
+            if sid is None and "data" in tick and isinstance(tick["data"], dict):
+                for k in ("securityId", "SecurityId", "sid"):
+                    if k in tick["data"]:
+                        sid = str(tick["data"][k])
+                        break
+
+            if sid is None:
+                # cannot identify security id
+                return
+
+            # find display name by sid
+            disp = None
+            for name, info in resolved_map.items():
+                if info.get("sid") == sid:
+                    disp = name
+                    break
+
+            if not disp:
+                # maybe resolved_map stores names differently - try partial match
+                for name, info in resolved_map.items():
+                    if info.get("sid") == sid:
+                        disp = name
+                        break
+
+            ltp = extract_ltp_from_tick(tick)
+
+            if disp:
+                if ltp is not None:
+                    latest[disp] = {"ltp": ltp, "raw": tick}
+                else:
+                    latest[disp] = {"ltp": None, "raw": tick}
+                # send throttled update
+                _maybe_send_telegram_update()
+        except Exception as e:
+            log.exception("Error in tick callback: %s", e)
+    return _on_tick
+
+# ---------- telegram send (throttled) ----------
+def _maybe_send_telegram_update():
+    global _last_sent
+    now = time.time()
+    if now - _last_sent < max(10, POLL_INTERVAL):  # ensure at least POLL_INTERVAL between sends (POLL_INTERVAL default 60)
+        return
+    _last_sent = now
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S IST")
+    lines = [f"LTP Update • {ts}"]
+    for name, info in resolved_map.items():
+        # resolved_map keys are display names we used originally (like "NIFTY 50")
+        sid = info.get("sid")
+        seg = info.get("seg") or ""
+        # find latest by display name (we stored by original name)
+        val = latest.get(name)
+        if val and val.get("ltp") is not None:
+            try:
+                ltp_f = float(val["ltp"])
+                lines.append(f"{name} ({seg}): {ltp_f:.2f}")
+            except Exception:
+                lines.append(f"{name} ({seg}): {val['ltp']}")
+        else:
+            lines.append(f"{name} ({seg}): (No Data)")
+    text = "\n".join(lines)
+    if tg_bot:
+        try:
+            tg_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+            log.info("Telegram update sent (%d lines).", len(lines))
+        except Exception as e:
+            log.exception("Failed to send Telegram message: %s", e)
+    else:
+        log.info("Telegram token not configured; skipping send. Message would be:\n%s", text)
+
+# ---------- main runner ----------
+def main():
+    global resolved_map
+    instruments, resolved_map = resolve_symbols_list()
+    # build instruments list in a format to pass to SDK (we'll try multiple patterns in create_feed)
+    try:
+        feed = create_feed(instruments)
+    except Exception as e:
+        log.exception("Could not create feed: %s", e)
+        raise
+
+    # attach callback using robust wrapper
+    callback = make_on_tick_callback(resolved_map)
+    try:
+        # many SDKs use feed.on_tick or feed.register or feed.set_on_tick
+        if hasattr(feed, "on_tick"):
+            feed.on_tick = callback
+        elif hasattr(feed, "register"):
+            feed.register("tick", callback)
+        elif hasattr(feed, "subscribe"):
+            feed.subscribe(callback)
+        else:
+            log.warning("Feed object has no known attach method; attempting attribute assignment 'on_tick'")
+            try:
+                setattr(feed, "on_tick", callback)
+            except Exception:
+                log.error("Couldn't attach callback to feed.")
+                raise
+
+        log.info("Connecting feed...")
+        feed.connect()
+        # block forever; feed will call our callback
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        log.info("Interrupted, disconnecting feed...")
+        try:
+            feed.disconnect()
+        except Exception:
+            pass
+    except Exception as e:
+        log.exception("Feed runtime error: %s", e)
+        try:
+            feed.disconnect()
+        except Exception:
+            pass
+        raise
+
+# allow importing module without running
 if __name__ == "__main__":
     main()
