@@ -1,121 +1,154 @@
-# bot_auto_resolve.py - WebSocket-based LTP bot with Telegram updates
 import os
-import time
 import logging
+import time
 from datetime import datetime
-from dotenv import load_dotenv
+from dhanhq import marketfeed
+from telegram import Bot
+from dhanhq_security_ids import INDICES_NSE, INDICES_BSE, NIFTY50_STOCKS
 
-# dhanhq marketfeed import; ensure dhanhq==2.0.2 installed
-try:
-    from dhanhq import marketfeed
-except Exception as e:
-    logging.error("dhanhq SDK not found or failed to import: %s", e)
-    raise
+# --------------------------------
+# Logging Setup
+# --------------------------------
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(message)s")
 
-# telegram Bot
-try:
-    from telegram import Bot
-except Exception as e:
-    logging.error("python-telegram-bot not found or failed to import: %s", e)
-    raise
+# --------------------------------
+# Env Vars
+# --------------------------------
+client_id = os.getenv("DHAN_CLIENT_ID")
+access_token = os.getenv("DHAN_ACCESS_TOKEN")
+telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
+telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
-load_dotenv()
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("bot_auto_resolve")
+bot = Bot(token=telegram_token)
 
-CLIENT_ID = os.getenv("DHAN_CLIENT_ID")
-ACCESS_TOKEN = os.getenv("DHAN_TOKEN")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
+# --------------------------------
+# Symbols to track (user-defined)
+# --------------------------------
+SYMBOLS = [
+    ("NIFTY 50", "indices_nse"),
+    ("NIFTY BANK", "indices_nse"),
+    ("SENSEX", "indices_bse"),
+    ("TATAMOTORS", "nifty50"),
+    ("RELIANCE", "nifty50"),
+    ("TCS", "nifty50"),
+]
 
-if not (CLIENT_ID and ACCESS_TOKEN and TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
-    log.error("Missing required environment variables. Fill config.example.env -> .env")
-    raise SystemExit(1)
+# --------------------------------
+# Helper - Resolve Security IDs
+# --------------------------------
+def resolve_symbols():
+    payload = []
+    resolved_map = {}
 
-tg_bot = Bot(token=TELEGRAM_TOKEN)
+    for symbol, stype in SYMBOLS:
+        try:
+            if stype == "indices_nse":
+                sid = INDICES_NSE.get(symbol)
+                seg = "NSE_INDEX"
+            elif stype == "indices_bse":
+                sid = INDICES_BSE.get(symbol)
+                seg = "BSE_INDEX"
+            else:  # default nifty50
+                sid = NIFTY50_STOCKS.get(symbol)
+                seg = "NSE_EQ"
 
-# symbols: map display name -> (segment, securityId)
-SYMBOLS = {
-    "NIFTY 50": ("NSE_INDEX", "13"),
-    "NIFTY BANK": ("NSE_INDEX", "25"),
-    "SENSEX": ("BSE_INDEX", "51"),
-    "TATAMOTORS": ("NSE_EQ", "3456"),
-    "RELIANCE": ("NSE_EQ", "2885"),
-    "TCS": ("NSE_EQ", "11536"),
-}
+            if sid:
+                payload.append((seg, sid))
+                resolved_map[f"{symbol} ({seg})"] = sid
+                logging.info(f"Resolved {symbol} -> {seg}:{sid}")
+            else:
+                resolved_map[f"{symbol}"] = None
+                logging.warning(f"{symbol} not found in dict")
+        except Exception as e:
+            logging.error(f"Error resolving {symbol}: {e}")
+            resolved_map[f"{symbol}"] = None
 
-latest_data = {name: None for name in SYMBOLS.keys()}
+    logging.info(f"Final Instruments: {payload}")
+    return payload, resolved_map
 
-def now_ist_str():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S IST")
+# --------------------------------
+# WebSocket Callback
+# --------------------------------
+ltp_data = {}
+resolved_payload, resolved_map = resolve_symbols()
 
 def on_tick(tick):
     try:
-        seg = tick.get("ExchangeSegment") or tick.get("Exchange")
-        sid = str(tick.get("SecurityId") or tick.get("securityId") or "")
-        # LTP fields may differ by SDK; try common keys
-        ltp = tick.get("LTP") or tick.get("ltp") or tick.get("last_price")
-        chg = tick.get("Change") or tick.get("change")
-        pct = tick.get("PercentChange") or tick.get("percent_change") or tick.get("percentChange")
-        for name, (s, i) in SYMBOLS.items():
-            if s == seg and i == sid:
-                latest_data[name] = (ltp, chg, pct, seg)
+        sid = str(tick.get("securityId"))
+        ltp = tick.get("lastPrice")
+
+        # Find symbol name
+        symbol_name = None
+        for k, v in resolved_map.items():
+            if v == sid:
+                symbol_name = k
                 break
-    except Exception as e:
-        log.error("Error processing tick: %s", e)
 
-def send_update():
-    now = now_ist_str()
-    lines = [f"<b>LTP Update • {now}</b>"]
-    for name, val in latest_data.items():
-        if not val or val[0] is None:
-            lines.append(f"{name}: (No Data)")
+        if not symbol_name:
+            return
+
+        if ltp is not None:
+            ltp_data[symbol_name] = f"{ltp}"
         else:
-            ltp, chg, pct, seg = val
-            try:
-                ltp_s = f"{float(ltp):.2f}"
-            except:
-                ltp_s = str(ltp)
-            try:
-                chg_s = f"{float(chg):+.2f}"
-            except:
-                chg_s = str(chg) if chg is not None else "0.00"
-            try:
-                pct_s = f"{float(pct):+.2f}%"
-            except:
-                pct_s = str(pct)
-            lines.append(f"{name} ({seg}): {ltp_s} ({chg_s}, {pct_s})")
-    text = "\n".join(lines)
-    try:
-        tg_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="HTML")
-        log.info("Telegram update sent.")
-    except Exception as e:
-        log.error("Failed to send Telegram message: %s", e)
+            ltp_data[symbol_name] = "(No Data)"
 
-def main():
-    log.info("Starting WebSocket LTP Bot...")
-    instruments = list(SYMBOLS.values())
-    # DhanFeed expects list of tuples (ExchangeSegment, SecurityId)
+        # Format & Send update every tick
+        send_update()
+    except Exception as e:
+        logging.error(f"Tick error: {e}")
+
+# --------------------------------
+# Telegram Send
+# --------------------------------
+last_sent = 0
+def send_update():
+    global last_sent
+    now = time.time()
+
+    # Limit updates: send every ~60s
+    if now - last_sent < 60:
+        return
+    last_sent = now
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S %Z")
+    msg_lines = [f"LTP Update • {ts}"]
+
+    for symbol, _ in SYMBOLS:
+        match = [k for k in ltp_data.keys() if k.startswith(symbol)]
+        if match:
+            msg_lines.append(f"{match[0]}: {ltp_data.get(match[0], '(No Data)')}")
+        else:
+            seg = "?"  # unknown
+            msg_lines.append(f"{symbol} ({seg}): (No Data)")
+
+    msg = "\n".join(msg_lines)
+    logging.info(f"Telegram Msg:\n{msg}")
+
+    try:
+        bot.send_message(chat_id=telegram_chat_id, text=msg)
+    except Exception as e:
+        logging.error(f"Telegram send failed: {e}")
+
+# --------------------------------
+# WebSocket Runner
+# --------------------------------
+def run_feed():
+    instruments = [(1, sid) for seg, sid in resolved_payload]  # 1 = NSE_EQ, etc.
     feed = marketfeed.DhanFeed(
-        client_id=CLIENT_ID,
-        access_token=ACCESS_TOKEN,
+        client_id=client_id,
+        access_token=access_token,
         instruments=instruments,
-        subscription_code=marketfeed.Ticker,
+        feed_type=marketfeed.FeedType.TICKER
     )
     feed.on_tick = on_tick
+    logging.info("Starting WebSocket LTP Bot...")
     feed.connect()
-    try:
-        while True:
-            send_update()
-            time.sleep(POLL_INTERVAL)
-    except KeyboardInterrupt:
-        log.info("Stopped by user")
-    finally:
-        try:
-            feed.disconnect()
-        except:
-            pass
 
 if __name__ == "__main__":
-    main()
+    while True:
+        try:
+            run_feed()
+        except Exception as e:
+            logging.error(f"WebSocket crashed: {e}, retrying in 5s...")
+            time.sleep(5)
