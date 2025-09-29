@@ -111,7 +111,7 @@ def send_update():
         return
     last_sent = now
 
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S %Z")
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     msg_lines = [f"LTP Update • {ts}"]
 
     for symbol, _ in SYMBOLS:
@@ -119,8 +119,7 @@ def send_update():
         if match:
             msg_lines.append(f"{match[0]}: {ltp_data.get(match[0], '(No Data)')}")
         else:
-            seg = "?"  # unknown
-            msg_lines.append(f"{symbol} ({seg}): (No Data)")
+            msg_lines.append(f"{symbol}: (No Data)")
 
     msg = "\n".join(msg_lines)
     logging.info(f"Telegram Msg:\n{msg}")
@@ -134,7 +133,7 @@ def send_update():
 # WebSocket Runner
 # --------------------------------
 def run_feed():
-    instruments = [(1, sid) for seg, sid in resolved_payload]  # 1 = NSE_EQ, etc.
+    instruments = [(1, sid) for seg, sid in resolved_payload]  # all seg → NSE_EQ = 1 fallback
     feed = marketfeed.DhanFeed(
         client_id=client_id,
         access_token=access_token,
@@ -142,13 +141,19 @@ def run_feed():
         feed_type=marketfeed.FeedType.TICKER
     )
     feed.on_tick = on_tick
-    logging.info("Starting WebSocket LTP Bot...")
+    logging.info("Starting DhanHQ LTP Bot...")
     feed.connect()
 
-if __name__ == "__main__":
+# --------------------------------
+# Main
+# --------------------------------
+def main():
     while True:
         try:
             run_feed()
         except Exception as e:
             logging.error(f"WebSocket crashed: {e}, retrying in 5s...")
             time.sleep(5)
+
+if __name__ == "__main__":
+    main()
